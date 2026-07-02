@@ -24,7 +24,7 @@
     "@hocuspocus/extension-logger": "^4.3.0",
     "@hocuspocus/extension-redis": "^4.3.0",
     "@hocuspocus/server": "^4.1.2",
-    "express": "^4.19.2",
+    "express": "^5.2.1",
     "ioredis": "^5.4.1",
     "jsonwebtoken": "^9.0.2",
     "lib0": "^0.2.97",
@@ -40,7 +40,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
-    "@types/express": "^4.17.21",
+    "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.7",
     "@types/node": "^22.7.4",
     "@types/ws": "^8.5.12",
