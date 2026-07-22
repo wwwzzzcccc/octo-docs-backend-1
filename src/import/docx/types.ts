@@ -28,7 +28,12 @@ export interface PmMark {
  */
 export function safeHref(raw: string | null | undefined): string | null {
   if (!raw) return null
-  const href = raw.trim()
+  // Relationship targets occasionally arrive already XML-escaped in source
+  // PM (`...?a=1&amp;b=2`). The DOCX writer escapes XML again, so without
+  // canonicalization every round-trip grows another `amp;`. Decode only the
+  // predefined amp entity (possibly repeated) before validating; this is URL
+  // attribute normalization, not general HTML/entity parsing.
+  const href = raw.trim().replace(/&(?:amp;)+/gi, '&')
   if (!href) return null
   // eslint-disable-next-line no-control-regex
   const cleaned = href.replace(/[\u0000-\u0020]+/g, '').toLowerCase()

@@ -44,6 +44,7 @@ import {
 import { docAttachmentRepo } from '../../db/repos/docAttachmentRepo.js'
 import { getObjectStore } from '../../storage/objectStore.js'
 import { config } from '../../config/env.js'
+import { sanitizeSvg } from '../../util/sanitizeSvg.js'
 
 export const boardExportRouter: ExpressRouter = Router()
 
@@ -83,11 +84,20 @@ function parseFormat(raw: string | undefined): ExportFormat | null {
 
 /** Magic-byte sniff → the mime a rasterizer/browser can decode, or null. */
 function sniffImageMime(buf: Buffer): string | null {
-  if (buf.length < 4) return null
-  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png'
-  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg'
-  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'image/gif'
-  return null
+  if (buf.length >= 4) {
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png'
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg'
+    if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'image/gif'
+  }
+  // SVG attachments reached storage only through the sanitizing upload path.
+  // Re-validate on export so a corrupt/legacy object cannot become active XML
+  // embedded in the generated board SVG.
+  try {
+    sanitizeSvg(buf)
+    return 'image/svg+xml'
+  } catch {
+    return null
+  }
 }
 
 /**

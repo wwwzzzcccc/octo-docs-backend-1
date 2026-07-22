@@ -1,0 +1,67 @@
+{
+  "group02NestedTask": {
+    "type": "doc",
+    "content": [
+      {
+        "type": "taskList",
+        "content": [
+          {
+            "type": "taskItem",
+            "attrs": { "checked": true },
+            "content": [
+              { "type": "paragraph", "content": [{ "type": "text", "text": " 嵌套任务父" }] },
+              {
+                "type": "taskList",
+                "content": [
+                  {
+                    "type": "taskItem",
+                    "attrs": { "checked": false },
+                    "content": [
+                      { "type": "paragraph", "content": [{ "type": "text", "text": " 子任务" }] }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "groups03_04_11Spacing": {
+    "type": "doc",
+    "content": [
+      { "type": "heading", "attrs": { "level": 1 }, "content": [{ "type": "text", "text": "数学公式 30 式样式测试" }] },
+      { "type": "paragraph", "content": [{ "type": "text", "text": "1. ", "marks": [{ "type": "bold" }] }] },
+      { "type": "blockMath", "attrs": { "latex": "\\frac{a}{b} + \\frac{c}{d}" } },
+      { "type": "paragraph", "content": [] },
+      { "type": "paragraph", "content": [{ "type": "text", "text": "表格之后" }] }
+    ]
+  },
+  "group07SpecialText": {
+    "type": "doc",
+    "content": [
+      {
+        "type": "paragraph",
+        "content": [
+          { "type": "text", "text": "XML 实体：< > & 与 &amp; &lt; &gt; 字面。" }
+        ]
+      },
+      {
+        "type": "paragraph",
+        "content": [
+          {
+            "type": "text",
+            "text": "https://example.com/very/long/path?a=1&b=2&c=3",
+            "marks": [
+              {
+                "type": "link",
+                "attrs": { "href": "https://example.com/very/long/path?a=1&amp;b=2&amp;c=3" }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

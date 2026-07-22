@@ -107,18 +107,20 @@ export async function getDocSceneHandler(req: Request, res: Response): Promise<v
 function validateOpsShape(body: unknown): BoardOps | null {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return null
   const b = body as Record<string, unknown>
-  const { elements, deletedElementIds, files } = b
+  const { elements, deletedElementIds, files, deletedFileIds } = b
 
   if (elements !== undefined && !Array.isArray(elements)) return null
   if (deletedElementIds !== undefined && !Array.isArray(deletedElementIds)) return null
   if (files !== undefined && (!files || typeof files !== 'object' || Array.isArray(files))) return null
+  if (deletedFileIds !== undefined && !Array.isArray(deletedFileIds)) return null
 
   const elCount = Array.isArray(elements) ? elements.length : 0
   const delCount = Array.isArray(deletedElementIds) ? deletedElementIds.length : 0
   const fileCount = files && typeof files === 'object' ? Object.keys(files).length : 0
-  if (elCount === 0 && delCount === 0 && fileCount === 0) return null
+  const fileDeleteCount = Array.isArray(deletedFileIds) ? deletedFileIds.length : 0
+  if (elCount === 0 && delCount === 0 && fileCount === 0 && fileDeleteCount === 0) return null
 
-  return { elements, deletedElementIds, files } as BoardOps
+  return { elements, deletedElementIds, files, deletedFileIds } as BoardOps
 }
 
 /**
@@ -132,7 +134,8 @@ function checkOpsBounds(ops: BoardOps): { status: number; error: string } | null
   const elements = Array.isArray(ops.elements) ? ops.elements : []
   const deletes = Array.isArray(ops.deletedElementIds) ? ops.deletedElementIds : []
   const files = ops.files && typeof ops.files === 'object' ? (ops.files as Record<string, unknown>) : {}
-  const total = elements.length + deletes.length + Object.keys(files).length
+  const fileDeletes = Array.isArray(ops.deletedFileIds) ? ops.deletedFileIds : []
+  const total = elements.length + deletes.length + Object.keys(files).length + fileDeletes.length
   if (total > config.boardSceneWrite.maxElements) {
     return { status: 413, error: 'too_many_elements' }
   }

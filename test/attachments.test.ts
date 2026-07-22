@@ -534,6 +534,46 @@ describe('POST attachments/copy (markdown-import image migration)', () => {
     expect(verifySignedUrl(body.mappings[0]!.url).valid).toBe(true)
   })
 
+  it('compensates object and row state when the target PUT fails', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_src', space_id: 's1', status: 1 } as never)
+    vi.mocked(resolveRole).mockResolvedValue('reader' as never)
+    vi.mocked(query)
+      .mockResolvedValueOnce([srcAttachment] as never)
+      .mockResolvedValue([] as never)
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { method?: string }) =>
+      init?.method === 'PUT'
+        ? ({ ok: false, status: 503 })
+        : ({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer }),
+    ))
+
+    const res = mockRes()
+    await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
+    expect((res.body as { notCopied: Array<{ reason: string }> }).notCopied[0]!.reason).toBe('copy_failed')
+    const sql = vi.mocked(query).mock.calls.map(([statement]) => String(statement))
+    expect(sql.some((statement) => statement.startsWith('INSERT INTO doc_attachment'))).toBe(false)
+    expect(sql.some((statement) => statement.startsWith('DELETE FROM doc_attachment'))).toBe(true)
+  })
+
+  it('compensates the uploaded object when database registration fails', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_src', space_id: 's1', status: 1 } as never)
+    vi.mocked(resolveRole).mockResolvedValue('reader' as never)
+    vi.mocked(query)
+      .mockResolvedValueOnce([srcAttachment] as never)
+      .mockRejectedValueOnce(new Error('register failed'))
+      .mockResolvedValue([] as never)
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { method?: string }) =>
+      init?.method === 'PUT'
+        ? ({ ok: true, status: 200 })
+        : ({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer }),
+    ))
+
+    const res = mockRes()
+    await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
+    expect((res.body as { notCopied: Array<{ reason: string }> }).notCopied[0]!.reason).toBe('copy_failed')
+    const sql = vi.mocked(query).mock.calls.map(([statement]) => String(statement))
+    expect(sql.some((statement) => statement.startsWith('DELETE FROM doc_attachment'))).toBe(true)
+  })
+
   it('degrades to notCopied when the source stream exceeds the size cap (never fully buffered)', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_src', space_id: 's1', status: 1 } as never)
     vi.mocked(resolveRole).mockResolvedValue('reader' as never)

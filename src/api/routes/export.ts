@@ -25,8 +25,15 @@
  */
 import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
-import { persistence } from '../../collab/persistence.js'
+import { readLiveDocState } from '../../collab/liveDocRead.js'
+import { readLiveSheet } from '../../collab/liveSheetWrite.js'
 import { yDocStateToProsemirrorJSON } from '../../agent/conversion.js'
+import { decodeSheetSnapshot, decodeSheetDimsSnapshot, decodeSheetDrawingsSnapshot, decodeSheetHyperLinksSnapshot, decodeSheetListSnapshot } from '../../collab/versionRestore.js'
+import { SheetSnapshotInvalidError, type SheetCell, type StoredSheetMeta } from '../../agent/sheetConversion.js'
+import { exportMarkdown, type PmNode } from '../../export/markdown.js'
+import { exportDocx, type DocxImage } from '../../export/docx.js'
+import { createCanvas, loadImage } from '@napi-rs/canvas'
+import { exportXlsx } from '../../export/xlsx.js'
 import { docAttachmentRepo } from '../../db/repos/docAttachmentRepo.js'
 import { getObjectStore } from '../../storage/objectStore.js'
 import { config } from '../../config/env.js'
@@ -216,18 +223,18 @@ export function collectFormulaLatex(pmJson: unknown): string[] {
 }
 
 /**
- * Probe each unique formula by compiling it alone; return the set of formulas
- * whose isolated compile fails (i.e. the malformed ones). A probe doc is a
- * single block-math node, so a `TypstCompileError` is attributable to that one
- * formula.
+ * Attribute formula compile failures with batched divide-and-conquer probes.
+ * A successful batch clears every formula in it at once; only a failing batch
+ * is split, until a failing singleton can be marked verbatim. For a document
+ * with many valid formulas and a few bad ones this takes O(k log n) compiles,
+ * rather than one compile per formula.
  *
- * Bounded to protect the scarce compile pool: at most `maxProbes` formulas are
- * compiled and probing stops once `budgetMs` of wall-clock is spent. If the
- * work exceeds either bound the probe is abandoned (`exhausted: true`) so the
- * caller skips the partial retry and goes straight to the whole-document
- * verbatim fallback instead of holding a compile slot for hundreds of probes.
- * Non-compile errors abort probing too (treated as "can't attribute"), again
- * deferring to the whole-doc fallback.
+ * Bounded to protect the scarce compile pool: at most `maxProbes` batch
+ * compiles run and probing stops once `budgetMs` of wall-clock is spent. Any
+ * still-unresolved formulas are conservatively marked verbatim. This is vital:
+ * exhausting the attribution budget must not turn formulas already proven
+ * valid into raw LaTeX. The caller can still compile the partially degraded
+ * document once and use the whole-document safety net only if that retry fails.
  */
 export async function probeFailingFormulas(
   latexList: string[],
@@ -237,21 +244,38 @@ export async function probeFailingFormulas(
   const failing = new Set<string>()
   const deadline = Date.now() + Math.max(0, opts.budgetMs)
   const limit = Math.max(0, opts.maxProbes)
-  if (latexList.length > limit) return { failing, exhausted: true }
-  let probed = 0
-  for (const latex of latexList) {
-    if (probed >= limit || Date.now() >= deadline) return { failing, exhausted: true }
-    probed++
-    const probeDoc = { type: 'doc', content: [{ type: 'blockMath', attrs: { latex } }] }
+  if (latexList.length === 0) return { failing, exhausted: false }
+
+  const pending: string[][] = [latexList]
+  let probes = 0
+  while (pending.length > 0) {
+    if (probes >= limit || Date.now() >= deadline) {
+      for (const group of pending) for (const latex of group) failing.add(latex)
+      return { failing, exhausted: true }
+    }
+    const group = pending.pop()!
+    probes++
+    const probeDoc = {
+      type: 'doc',
+      content: group.map((latex) => ({ type: 'blockMath', attrs: { latex } })),
+    }
     try {
       const src = renderTypst(probeDoc, { title, attachments: new Map(), imagePaths: new Map() })
       await compileTypst(src, [])
     } catch (e) {
-      if (e instanceof TypstCompileError) failing.add(latex)
-      // A non-compile error (timeout, spawn failure, ...) means we can't safely
-      // attribute the break to one formula: abandon probing and let the
-      // whole-document verbatim fallback handle it.
-      else return { failing, exhausted: true }
+      if (!(e instanceof TypstCompileError)) {
+        // We cannot attribute infrastructure failures. Conservatively degrade
+        // this and every pending group, preserving any batches already proven.
+        for (const latex of group) failing.add(latex)
+        for (const rest of pending) for (const latex of rest) failing.add(latex)
+        return { failing, exhausted: true }
+      }
+      if (group.length === 1) {
+        failing.add(group[0]!)
+      } else {
+        const mid = Math.ceil(group.length / 2)
+        pending.push(group.slice(mid), group.slice(0, mid))
+      }
     }
   }
   return { failing, exhausted: false }
@@ -292,18 +316,156 @@ async function tryDownload(url: string, maxBytes: number): Promise<Buffer | null
   }
 }
 
-function contentDisposition(title: string): string {
+function contentDisposition(title: string, extension = 'pdf'): string {
   const base = title.trim() || '未命名文档'
-  const encoded = encodeURIComponent(`${base}.pdf`)
-  const ascii = base.replace(/[^\x20-\x7E]/g, '').replace(/["\\]/g, '').trim() || 'document'
-  return `attachment; filename="${ascii}.pdf"; filename*=UTF-8''${encoded}`
+  const encoded = encodeURIComponent(`${base}.${extension}`)
+  const ascii = base.replace(/[^\x20-\x7E]/g, '').replace(/["\\\r\n]/g, '').trim() || 'document'
+  return `attachment; filename="${ascii}.${extension}"; filename*=UTF-8''${encoded}`
 }
 
 exportRouter.post('/:docId/export/pdf', exportPdfHandler)
+exportRouter.get('/:docId/export/file', exportFileHandler)
+
+const FILE_FORMATS = new Set(['md', 'docx', 'pdf', 'xlsx'])
+
+/** Unified binary export used by both the human and bot router mounts. */
+export async function exportFileHandler(req: Request, res: Response): Promise<void> {
+  const raw = Array.isArray(req.query.format) ? req.query.format[0] : req.query.format
+  const format = typeof raw === 'string' ? raw.toLowerCase() : ''
+  if (!FILE_FORMATS.has(format)) {
+    res.status(400).json({ error: 'invalid_format' })
+    return
+  }
+  // Keep the mature Typst path as the single PDF implementation (including its
+  // queue and formula fallbacks). It performs the same reader guard below.
+  if (format === 'pdf') {
+    await exportPdfHandler(req, res)
+    return
+  }
+
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  if (!guard) return
+  const expectedType = format === 'xlsx' ? 'sheet' : 'doc'
+  if (guard.meta.doc_type !== expectedType) {
+    res.status(409).json({ error: 'unsupported_doc_type' })
+    return
+  }
+
+  try {
+    let bytes: Buffer
+    let mime: string
+    if (format === 'xlsx') {
+      const { state } = await readLiveSheet(guard.meta.document_name)
+      const cells = decodeSheetSnapshot(state) as Record<string, SheetCell>
+      const dims = decodeSheetDimsSnapshot(state)
+      const drawings = decodeSheetDrawingsSnapshot(state)
+      const hyperlinks = decodeSheetHyperLinksSnapshot(state)
+      const sheets = decodeSheetListSnapshot(state) as Record<string, StoredSheetMeta>
+      bytes = await exportXlsx(cells, guard.meta.title, { dims, drawings, hyperlinks, sheets })
+      mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    } else {
+      const state = await readLiveDocState(guard.meta.document_name)
+      const doc = yDocStateToProsemirrorJSON(state) as PmNode
+      if (format === 'md') {
+        await hydrateAttachmentUrls(doc, guard.meta.doc_id)
+        bytes = Buffer.from(exportMarkdown(doc), 'utf8')
+        mime = 'text/markdown; charset=utf-8'
+      } else {
+        const images = await resolveDocxImages(guard.meta.doc_id, collectReferencedAttachIds(doc))
+        bytes = await exportDocx(doc, images)
+        mime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      }
+    }
+    res.status(200)
+    res.setHeader('Content-Type', mime)
+    res.setHeader('Content-Disposition', contentDisposition(guard.meta.title, format))
+    res.setHeader('Content-Length', String(bytes.length))
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    res.end(bytes)
+  } catch (err) {
+    if (err instanceof SheetSnapshotInvalidError) {
+      res.status(409).json({ error: 'sheet_snapshot_invalid' })
+      return
+    }
+    // eslint-disable-next-line no-console
+    console.error(`[export:file] export failed for doc ${guard.meta.doc_id}:`, err)
+    res.status(500).json({ error: 'export_failed' })
+  }
+}
+
+async function hydrateAttachmentUrls(doc: PmNode, docId: string): Promise<void> {
+  const attachments = await docAttachmentRepo.listByDoc(docId)
+  const byId = new Map(attachments.map((a) => [a.attachId, a]))
+  const store = getObjectStore()
+  const walk = (node: PmNode): void => {
+    if ((node.type === 'image' || node.type === 'fileAttachment') && node.attrs) {
+      const attachId = node.attrs.attachId
+      if (typeof attachId === 'string') {
+        const attachment = byId.get(attachId)
+        if (attachment) {
+          const signed = store.presignGet(attachment.objectKey, config.attachments.readUrlTtlSeconds)
+          // Preserve a non-secret, durable source identity independently of the
+          // expiring signature. Importers authorize and copy this attachment;
+          // the fragment is never sent to object storage and contains no token.
+          node.attrs.src = `${signed}#${encodeURIComponent(`octo-attachment:${docId}:${attachId}`)}`
+          if (node.type === 'fileAttachment' && !node.attrs.fileName) node.attrs.fileName = attachment.fileName
+        }
+      }
+    }
+    for (const child of node.content ?? []) walk(child)
+  }
+  walk(doc)
+}
+
+async function resolveDocxImages(
+  docId: string,
+  referencedIds: ReadonlySet<string>,
+): Promise<Map<string, DocxImage>> {
+  const images = new Map<string, DocxImage>()
+  const attachments = await docAttachmentRepo.listByDoc(docId)
+  const store = getObjectStore()
+  let total = 0
+  for (const attachment of attachments) {
+    if (!referencedIds.has(attachment.attachId) || images.size >= config.typstExport.maxImageCount) continue
+    if (attachment.sizeBytes > config.typstExport.maxImageBytes) continue
+    const bytes = await tryDownload(
+      store.presignGet(attachment.objectKey, config.attachments.readUrlTtlSeconds),
+      config.typstExport.maxImageBytes,
+    )
+    if (!bytes || total + bytes.length > config.typstExport.maxImageTotalBytes) continue
+    const type = sniffImageExt(bytes)
+    if (!type) continue
+    try {
+      const data = type === 'svg' ? sanitizeSvg(bytes) : bytes
+      const image = await loadImage(data)
+      let fallback: Buffer | undefined
+      if (type === 'svg') {
+        const canvas = createCanvas(image.width, image.height)
+        canvas.getContext('2d').drawImage(image, 0, 0)
+        fallback = canvas.toBuffer('image/png')
+      }
+      images.set(attachment.attachId, {
+        data,
+        type,
+        width: image.width,
+        height: image.height,
+        ...(fallback ? { fallback } : {}),
+      })
+      total += data.length + (fallback?.length ?? 0)
+    } catch {
+      // A corrupt image is omitted without sinking the whole document export.
+    }
+  }
+  return images
+}
 
 export async function exportPdfHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
+  if (guard.meta.doc_type !== 'doc') {
+    res.status(409).json({ error: 'unsupported_doc_type' })
+    return
+  }
 
   // Gate the whole pipeline (prep + compile) behind the queue, matching the
   // Gate the whole pipeline (prep + compile) behind the queue so heavy prep
@@ -323,7 +485,9 @@ export async function exportPdfHandler(req: Request, res: Response): Promise<voi
 
   const docId = guard.meta.doc_id
   try {
-    const state = await persistence.fetch(guard.meta.document_name)
+    // Read the live in-memory Y.Doc when active, hydrating from persistence when
+    // inactive. This avoids exporting a debounced/stale persisted snapshot.
+    const state = await readLiveDocState(guard.meta.document_name)
     const pmJson = state ? yDocStateToProsemirrorJSON(state) : EMPTY_DOC
 
     const referencedIds = collectReferencedAttachIds(pmJson)
@@ -349,7 +513,7 @@ export async function exportPdfHandler(req: Request, res: Response): Promise<voi
         { maxProbes: config.typstExport.maxFormulaProbes, budgetMs: config.typstExport.formulaProbeBudgetMs },
       )
       let partialPdf: Buffer | null = null
-      if (!exhausted && verbatimFormulas.size > 0) {
+      if (verbatimFormulas.size > 0) {
         try {
           const partial = renderTypst(pmJson, {
             title: guard.meta.title,
@@ -359,7 +523,7 @@ export async function exportPdfHandler(req: Request, res: Response): Promise<voi
           })
           partialPdf = await compileTypst(partial, images)
           // eslint-disable-next-line no-console
-          console.warn(`[export:typst] doc ${docId} recovered with ${verbatimFormulas.size} formula(s) verbatim`)
+          console.warn(`[export:typst] doc ${docId} recovered with ${verbatimFormulas.size} formula(s) verbatim${exhausted ? ' (probe budget exhausted)' : ''}`)
         } catch (partialErr) {
           if (!(partialErr instanceof TypstCompileError)) throw partialErr
         }
@@ -383,6 +547,7 @@ export async function exportPdfHandler(req: Request, res: Response): Promise<voi
     res.setHeader('Content-Type', 'application/pdf')
     res.setHeader('Content-Disposition', contentDisposition(guard.meta.title))
     res.setHeader('Content-Length', String(pdf.length))
+    res.setHeader('X-Content-Type-Options', 'nosniff')
     res.end(pdf)
   } catch (err) {
     if (err instanceof TypstTimeoutError) {

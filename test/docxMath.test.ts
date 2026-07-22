@@ -28,6 +28,11 @@ describe('ommlToLatex — conversion', () => {
     expect(ommlToLatex(OMML.fraction)).toBe('\\frac{a}{b}')
   })
 
+  it('unwraps a malformed fraction with an empty denominator', () => {
+    const malformed = `<m:oMath ${M}><m:f><m:num><m:r><m:t>x</m:t></m:r></m:num><m:den/></m:f></m:oMath>`
+    expect(ommlToLatex(malformed)).toBe('x')
+  })
+
   it('converts a subscript', () => {
     expect(ommlToLatex(OMML.subscript)).toBe('a_{i}')
   })

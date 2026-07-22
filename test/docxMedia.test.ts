@@ -8,9 +8,13 @@ import { sniffImageMime, resolveImages, imagePlaceholder, type MediaUploadCtx, t
 import type { ExtractedEntry } from '../src/import/docx/extract.js'
 import { walkDocument } from '../src/import/docx/document.js'
 import type { PmNode } from '../src/import/docx/types.js'
+import { readFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { importDocxWithMedia } from '../src/import/docx/index.js'
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4])
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4])
+const SVG = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10" fill="red"/></svg>')
 
 describe('sniffImageMime', () => {
   it('detects png / jpeg / gif by magic number, not extension', () => {
@@ -20,6 +24,9 @@ describe('sniffImageMime', () => {
   })
   it('returns null for non-image bytes', () => {
     expect(sniffImageMime(Buffer.from('<html>'))).toBeNull()
+  })
+  it('recognises SVG XML bytes rather than trusting a filename', () => {
+    expect(sniffImageMime(SVG)).toBe('image/svg+xml')
   })
 })
 
@@ -58,6 +65,27 @@ describe('resolveImages — success', () => {
     expect(received!.mime).toBe('image/jpeg')
     expect(received!.fileName).toBe('photo.jpg')
   })
+
+  it('sanitizes SVG bytes before upload', async () => {
+    const dirty = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script><rect onload="x()" fill="red"/></svg>')
+    const doc: PmNode = { type: 'doc', content: [imagePlaceholder('rId1', null)] }
+    let uploaded: Buffer | undefined
+    await resolveImages(doc, () => media('word/media/vector.bin', dirty), ctx({ upload: async i => { uploaded = i.bytes; return 'svg-aid' } }), [])
+    expect(uploaded?.toString()).toContain('<rect')
+    expect(uploaded?.toString()).not.toMatch(/script|onload/i)
+    expect(doc.content![0]).toEqual({ type: 'image', attrs: { attachId: 'svg-aid' } })
+  })
+
+  it.skipIf(!existsSync('/Users/cc/Projects/cli-e2e-exports/doc-svg/doc-with-svg.docx'))('imports the real DOCX native SVG relation once instead of its PNG fallback', async () => {
+    const input = await readFile('/Users/cc/Projects/cli-e2e-exports/doc-svg/doc-with-svg.docx')
+    const uploads: Array<{ mime: string; fileName: string; bytes: Buffer }> = []
+    const result = await importDocxWithMedia(input, ctx({ upload: async i => { uploads.push(i); return 'native-svg' } }))
+    expect(uploads).toHaveLength(1)
+    expect(uploads[0]).toMatchObject({ mime: 'image/svg+xml' })
+    expect(uploads[0]!.fileName).toMatch(/\.svg$/)
+    expect(uploads[0]!.bytes.toString()).toContain('<svg')
+    expect(JSON.stringify(result.doc)).toContain('native-svg')
+  })
 })
 
 describe('resolveImages — degradation (never sinks the import)', () => {
@@ -89,6 +117,23 @@ describe('resolveImages — degradation (never sinks the import)', () => {
     )
     expect(w.join(' ')).toMatch(/upload failed/)
   })
+  it('degrades an SVG that the sanitizer rejects without uploading it', async () => {
+    let uploaded = false
+    const unsafe = Buffer.from('<!DOCTYPE svg [<!ENTITY x SYSTEM "file:///etc/passwd">]><svg xmlns="http://www.w3.org/2000/svg">&x;</svg>')
+    const w = await degradeReason(() => media('word/media/x.svg', unsafe), ctx({ upload: async () => { uploaded = true; return 'bad' } }))
+    expect(uploaded).toBe(false)
+    expect(w.join(' ')).toMatch(/unsafe SVG/)
+  })
+  it('uses the raster fallback when a preferred native SVG is rejected', async () => {
+    const unsafe = Buffer.from('<!DOCTYPE svg><svg xmlns="http://www.w3.org/2000/svg"/>')
+    const doc: PmNode = { type: 'doc', content: [imagePlaceholder('svgRel', 'chart', 'pngRel')] }
+    let uploadedMime: string | undefined
+    const warnings: string[] = []
+    await resolveImages(doc, rel => rel === 'svgRel' ? media('x.svg', unsafe) : media('x.png', PNG), ctx({ upload: async i => { uploadedMime = i.mime; return 'png-fallback' } }), warnings)
+    expect(uploadedMime).toBe('image/png')
+    expect(doc.content![0]).toEqual({ type: 'image', attrs: { attachId: 'png-fallback', alt: 'chart' } })
+    expect(warnings.join(' ')).toMatch(/raster fallback was used/)
+  })
 })
 
 describe('walkDocument — drawing detection', () => {
@@ -110,5 +155,12 @@ describe('walkDocument — drawing detection', () => {
     expect(img).toBeDefined()
     expect((img.attrs as Record<string, unknown>)._embedRel).toBe('rId7')
     expect((img.attrs as Record<string, unknown>).alt).toBe('my chart')
+  })
+
+  it('prefers asvg:svgBlip over the a:blip raster fallback', () => {
+    const inner = '<w:p><w:r><w:drawing><a:blip xmlns:a="http://a" r:embed="pngRel"><a:extLst><a:ext><asvg:svgBlip xmlns:asvg="http://svg" r:embed="svgRel"/></a:ext></a:extLst></a:blip></w:drawing></w:r></w:p>'
+    const xml = Buffer.from(`<?xml version="1.0"?><w:document xmlns:w="http://x" xmlns:r="http://r"><w:body>${inner}</w:body></w:document>`)
+    const out = walkDocument(xml, new Map())
+    expect(out.content.find(n => n.type === 'image')?.attrs).toMatchObject({ _embedRel: 'svgRel', _fallbackEmbedRel: 'pngRel' })
   })
 })

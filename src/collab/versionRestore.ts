@@ -99,6 +99,16 @@ export function decodeSheetDimsSnapshot(targetState: Uint8Array): Record<string,
   return validateSheetDims(raw)
 }
 
+/** Read and validate floating drawings for replace-style imports. */
+export function decodeSheetDrawingsSnapshot(targetState: Uint8Array): Record<string, StoredDrawing> {
+  const doc = new Y.Doc()
+  Y.applyUpdate(doc, targetState)
+  const drawings = doc.getMap(SHEET_DRAWINGS_FIELD)
+  const out: Record<string, StoredDrawing> = {}
+  for (const [key, val] of drawings.entries()) out[key] = validateSheetDrawing(key, val)
+  return out
+}
+
 /**
  * Read the spreadsheet hyperlinks out of a snapshot's binary state. Returns a
  * plain `{ ${sheetId}!${linkId}: {id,row,column,payload,display?} }` object (empty
@@ -107,7 +117,7 @@ export function decodeSheetDimsSnapshot(targetState: Uint8Array): Record<string,
  * function; a violation throws SheetSnapshotInvalidError, which the route maps to
  * 409. Hyperlinks are part of the GET read surface (unlike drawings).
  */
-export function decodeSheetHyperLinksSnapshot(targetState: Uint8Array): Record<string, unknown> {
+export function decodeSheetHyperLinksSnapshot(targetState: Uint8Array): Record<string, StoredHyperLink> {
   const doc = new Y.Doc()
   Y.applyUpdate(doc, targetState)
   const links = doc.getMap(SHEET_HYPERLINKS_FIELD)

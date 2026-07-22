@@ -54,6 +54,14 @@ export function ommlToLatex(ommlXml: string): string | null {
   if (ommlXml.length > MAX_OMML_BYTES) return null
   const xml = ensureMathNs(stripDoctype(ommlXml))
   try {
+    // Some Office producers store an already-linearized TeX equation in one
+    // m:t run, then surround it with hundreds of empty script/radical/matrix
+    // layout boxes. Feeding those boxes through MathML invents a forest of
+    // roots and brackets that is not present in the formula. When there is one
+    // and only one non-empty text run and it contains unmistakable TeX control
+    // words, that run is the authoritative semantic representation.
+    const linear = singleLinearLatexRun(xml)
+    if (linear) return normalizeRecoveredLatex(linear)
     const mmlStr = ommlToMathmlString(xml)
     if (!mmlStr) return null
     const latex = MathMLToLaTeX.convert(restoreDefaultFences(mmlStr))
@@ -67,6 +75,20 @@ export function ommlToLatex(ommlXml: string): string | null {
   } catch {
     return null
   }
+}
+
+function singleLinearLatexRun(xml: string): string | null {
+  const runs = [...xml.matchAll(/<m:t\b[^>]*>([\s\S]*?)<\/m:t>/g)]
+    .map((match) => {
+      const raw = match[1]!.trim()
+      // This shortcut accepts only literal TeX text. Any XML entity could decode
+      // into markup or change token meaning, so route it through the structured
+      // OMML converter rather than decoding/stripping it here.
+      return raw.includes('&') || raw.includes('<') || raw.includes('>') ? '' : raw
+    })
+    .filter(Boolean)
+  if (runs.length !== 1 || !/\\[a-zA-Z]+(?:_|\b)/.test(runs[0]!)) return null
+  return runs[0]!
 }
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -211,14 +233,11 @@ function convertNode(n: OrderedNode, inFName: boolean): string {
     case 'm:r':
       return convertRun(n, inFName)
     case 'm:sSup':
-      return `<msup>${mrow(child(n, 'm:e'))}${mrow(child(n, 'm:sup'))}</msup>`
+      return convertScript(n, 'sup')
     case 'm:sSub':
-      return `<msub>${mrow(child(n, 'm:e'))}${mrow(child(n, 'm:sub'))}</msub>`
+      return convertScript(n, 'sub')
     case 'm:sSubSup':
-      return (
-        `<msubsup>${mrow(child(n, 'm:e'))}` +
-        `${mrow(child(n, 'm:sub'))}${mrow(child(n, 'm:sup'))}</msubsup>`
-      )
+      return convertSubSup(n)
     case 'm:f':
       return convertFraction(n)
     case 'm:rad':
@@ -245,6 +264,24 @@ function convertNode(n: OrderedNode, inFName: boolean): string {
       // Unknown wrapper: descend into its children (lenient walk).
       return convertSeq(kids(n), inFName)
   }
+}
+
+/** Empty Office script boxes are layout debris, not exponents/subscripts. */
+function convertScript(n: OrderedNode, kind: 'sub' | 'sup'): string {
+  const base = convertSlot(child(n, 'm:e'))
+  const script = convertSlot(child(n, `m:${kind}`))
+  if (!script) return `<mrow>${base}</mrow>`
+  return `<m${kind}>${`<mrow>${base}</mrow>`}<mrow>${script}</mrow></m${kind}>`
+}
+
+function convertSubSup(n: OrderedNode): string {
+  const base = convertSlot(child(n, 'm:e'))
+  const sub = convertSlot(child(n, 'm:sub'))
+  const sup = convertSlot(child(n, 'm:sup'))
+  if (!sub && !sup) return `<mrow>${base}</mrow>`
+  if (!sub) return `<msup><mrow>${base}</mrow><mrow>${sup}</mrow></msup>`
+  if (!sup) return `<msub><mrow>${base}</mrow><mrow>${sub}</mrow></msub>`
+  return `<msubsup><mrow>${base}</mrow><mrow>${sub}</mrow><mrow>${sup}</mrow></msubsup>`
 }
 
 /**
@@ -292,7 +329,17 @@ function convertFraction(n: OrderedNode): string {
   let attrs = ''
   if (lower === 'nobar') attrs = ' linethickness="0pt"'
   else if (lower === 'skw' || lower === 'lin') attrs = ' bevelled="true"'
-  return `<mfrac${attrs}>${mrow(child(n, 'm:num'))}${mrow(child(n, 'm:den'))}</mfrac>`
+  const numerator = convertSlot(child(n, 'm:num'))
+  const denominator = convertSlot(child(n, 'm:den'))
+  // Word/third-party producers occasionally leave a structurally present but
+  // empty denominator while repeatedly wrapping an equation. Rendering those
+  // malformed `m:f` nodes as real fractions creates a tower of zero-height
+  // denominators; Typst then collapses the equation into overlapping, illegible
+  // glyphs. An empty denominator carries no mathematical value, so preserve the
+  // numerator directly. Proper fractions (including an empty numerator) retain
+  // their normal conversion.
+  if (denominator.length === 0) return `<mrow>${numerator}</mrow>`
+  return `<mfrac${attrs}><mrow>${numerator}</mrow><mrow>${denominator}</mrow></mfrac>`
 }
 
 /** `<m:rad>` radical: msqrt when the degree is hidden/empty, else mroot. */
@@ -390,11 +437,56 @@ function convertDelimiter(n: OrderedNode): string {
   const parts = childrenNamed(n, 'm:e')
     .map((e) => `<mrow>${convertSlot(e)}</mrow>`)
     .join('')
+  // Several Office producers wrap an expression in repeated one-cell matrices,
+  // each carrying another delimiter. Those matrices have no row/column meaning;
+  // preserving every shell creates gigantic, invalid TeX while changing no
+  // mathematical content. Remove only this exact no-op shape. Real vectors,
+  // matrices and ordinary delimiters are untouched.
+  if (childrenNamed(n, 'm:e').length === 1) {
+    const e = childrenNamed(n, 'm:e')[0]!
+    const visible = kids(e).filter((c) => orderedTag(c) !== 'm:ctrlPr')
+    if (
+      visible.length === 1 &&
+      orderedTag(visible[0]!) === 'm:m' &&
+      isOneCellMatrix(visible[0]!) &&
+      isRedundantMatrixShell(n)
+    ) {
+      return convertSlot(child(childrenNamed(visible[0]!, 'm:mr')[0]!, 'm:e'))
+    }
+  }
   return `<mfenced${attrs}>${parts}</mfenced>`
+}
+
+function isOneCellMatrix(n: OrderedNode): boolean {
+  const rows = childrenNamed(n, 'm:mr')
+  return rows.length === 1 && childrenNamed(rows[0]!, 'm:e').length === 1
+}
+
+function isRedundantMatrixShell(n: OrderedNode): boolean {
+  const props = child(n, 'm:dPr')
+  const beg = props ? orderedAttr(child(props, 'm:begChr') ?? {}, 'm:val') : null
+  const end = props ? orderedAttr(child(props, 'm:endChr') ?? {}, 'm:val') : null
+  // Keep explicit square/curly/bar delimiters: those carry real semantics even
+  // around one cell. The pathological fixtures repeat default parenthesis
+  // shells (and occasionally omit the properties entirely).
+  return (beg == null || beg === '(') && (end == null || end === ')')
 }
 
 /** `<m:m>` matrix → `<mtable><mtr><mtd>…`. Each `<m:e>` in a row is one cell. */
 function convertMatrix(n: OrderedNode): string {
+  if (isOneCellMatrix(n)) {
+    const row = childrenNamed(n, 'm:mr')[0]!
+    const cell = childrenNamed(row, 'm:e')[0]!
+    const body = convertSlot(cell)
+    // A one-cell matrix nested around another structural object is an Office
+    // layout shell. Keep a genuine scalar 1×1 matrix, but discard wrappers
+    // whose sole cell is another matrix/delimiter/radical/script.
+    const structural = kids(cell).filter((c) => {
+      const tag = orderedTag(c)
+      return tag != null && tag !== '#text' && tag !== 'm:ctrlPr'
+    })
+    if (structural.length === 1 && orderedTag(structural[0]!) !== 'm:r') return `<mrow>${body}</mrow>`
+  }
   let rows = ''
   for (const mr of childrenNamed(n, 'm:mr')) {
     let cells = ''
@@ -501,6 +593,20 @@ function uniformRunColor(ommlXml: string): string | null {
  */
 export function normalizeRecoveredLatex(latex: string): string {
   let out = latex
+
+  // A literal Office circumflex followed by a braced group is recovered by
+  // mathml-to-latex as a bare `\hat` command. Bare accents are invalid TeX and
+  // render as red source text. Bind the following balanced visible-brace group
+  // as the accent argument; importantly this remains an accent and must never
+  // be rewritten as the exponent x^2.
+  out = out.replace(
+    /\\hat\s+(\\left\\\{(?:[^{}]|\{[^{}]*\})*\\right\\\})/g,
+    '\\widehat{$1}',
+  )
+
+  // mathml-to-latex uses empty \textrm boxes for Office spacing runs. They do
+  // not carry semantics and make otherwise valid matrix expressions enormous.
+  out = out.replace(/\\textrm\{\s*\}/g, ' ').replace(/ {2,}/g, ' ')
 
   // 0. `\hdots` is not a KaTeX/LaTeX command; map it to `\dots`. (Also handled on
   //    export, but repair it here too for docx produced elsewhere.)

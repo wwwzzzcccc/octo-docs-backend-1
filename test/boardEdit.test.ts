@@ -62,6 +62,7 @@ describe('validateBoardOps — fail-closed contract', () => {
   it('accepts a usable file ref', () => {
     const v = validateBoardOps({ files: { f1: { attachId: 'a1', mimeType: 'image/png' } } })
     expect(v.fileUpserts).toEqual([['f1', { attachId: 'a1', mimeType: 'image/png' }]])
+    expect(v.fileDeletes).toEqual([])
   })
 })
 
@@ -107,6 +108,19 @@ describe('applyBoardOpsToDoc — element-level upsert/delete (CAS)', () => {
     const v = validateBoardOps({ deletedElementIds: ['ghost'] })
     doc.transact(() => applyBoardOpsToDoc(doc, v))
     expect(getElementsMap(doc).has('ghost')).toBe(false)
+  })
+
+
+  it('file delete removes a stale reference during full-scene replacement', () => {
+    const doc = boardDoc()
+    doc.transact(() => {
+      const file = new Y.Map<unknown>()
+      file.set('attachId', 'a1')
+      getFilesMap(doc).set('stale', file)
+    })
+    const v = validateBoardOps({ deletedFileIds: ['stale'] })
+    doc.transact(() => applyBoardOpsToDoc(doc, v))
+    expect(getFilesMap(doc).has('stale')).toBe(false)
   })
 
   it('file upsert writes the canonical file ref', () => {

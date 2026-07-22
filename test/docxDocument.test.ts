@@ -417,12 +417,11 @@ describe('walkDocument — entity decoding in plain text', () => {
 })
 
 describe('walkDocument — run font size & colour (textStyle)', () => {
-  it('reads w:sz (half-points) back to the editor px value', () => {
-    // Exporter writes parseFloat("18px")*2 = 36 half-points; reverse => "18px".
+  it('reads w:sz (half-points) back to the equivalent CSS px value', () => {
     const xml = docXml('<w:p><w:r><w:rPr><w:sz w:val="36"/></w:rPr><w:t>big</w:t></w:r></w:p>')
     const out = walkDocument(xml, new Map())
     expect(out.content[0]?.content?.[0]?.marks).toEqual([
-      { type: 'textStyle', attrs: { fontSize: '18px' } },
+      { type: 'textStyle', attrs: { fontSize: '24px' } },
     ])
   })
 
@@ -432,7 +431,7 @@ describe('walkDocument — run font size & colour (textStyle)', () => {
     )
     const out = walkDocument(xml, new Map())
     expect(out.content[0]?.content?.[0]?.marks).toEqual([
-      { type: 'textStyle', attrs: { color: '#ff0000', fontSize: '12px' } },
+      { type: 'textStyle', attrs: { color: '#ff0000', fontSize: '16px' } },
     ])
   })
 })

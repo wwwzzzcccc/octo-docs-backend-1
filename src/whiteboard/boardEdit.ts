@@ -59,6 +59,8 @@ export interface BoardOps {
   deletedElementIds?: unknown
   /** File reference entries to upsert, keyed by fileId. */
   files?: unknown
+  /** File ids to hard-delete. Used only by authoritative full-scene replacement. */
+  deletedFileIds?: unknown
 }
 
 /** The validated, contract-checked batch ready to apply to a live board doc. */
@@ -66,6 +68,7 @@ export interface ValidatedBoardOps {
   upserts: WhiteboardElement[]
   deletes: string[]
   fileUpserts: Array<[string, FileRef]>
+  fileDeletes: string[]
 }
 
 /** Coerce a stored `version` to the same clean int normalizeElement guarantees. */
@@ -116,6 +119,17 @@ export function validateBoardOps(ops: BoardOps): ValidatedBoardOps {
     }
   }
 
+  const fileDeletes: string[] = []
+  if (ops.deletedFileIds !== undefined) {
+    if (!Array.isArray(ops.deletedFileIds)) throw new BoardFileInvalidError('deletedFileIds must be an array')
+    for (const fid of ops.deletedFileIds) {
+      if (typeof fid !== 'string' || fid.length === 0 || isReservedEntryKey(fid)) {
+        throw new BoardFileInvalidError('deletedFileIds entry must be a non-empty safe string')
+      }
+      fileDeletes.push(fid)
+    }
+  }
+
   const fileUpserts: Array<[string, FileRef]> = []
   if (ops.files !== undefined) {
     if (!ops.files || typeof ops.files !== 'object' || Array.isArray(ops.files)) {
@@ -138,7 +152,7 @@ export function validateBoardOps(ops: BoardOps): ValidatedBoardOps {
     }
   }
 
-  return { upserts, deletes, fileUpserts }
+  return { upserts, deletes, fileUpserts, fileDeletes }
 }
 
 /**
@@ -189,6 +203,8 @@ export function applyBoardOpsToDoc(doc: Y.Doc, ops: ValidatedBoardOps): void {
     existing.set('versionNonce', deterministicNonce(`${id}:${nextVersion}`))
     existing.set('isDeleted', true)
   }
+
+  for (const fid of ops.fileDeletes) files.delete(fid)
 
   for (const [fid, ref] of ops.fileUpserts) {
     let yF = files.get(fid)

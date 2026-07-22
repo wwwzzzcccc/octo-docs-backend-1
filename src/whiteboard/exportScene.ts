@@ -368,8 +368,11 @@ function renderFreedraw(el: Record<string, unknown>): string {
 function fontFamily(code: unknown): string {
   const c = numOf(code, 1)
   if (c === 3) return 'monospace'
-  if (c === 2) return 'sans-serif'
-  return 'sans-serif' // 1 = hand-drawn (Virgil); fall back to sans-serif
+  // Keep a concrete CJK-capable fallback first for Skia's SVG renderer. Generic
+  // sans-serif alone can resolve to a Latin-only face even after system fonts
+  // are registered, producing □ for otherwise valid Chinese text.
+  if (c === 2) return 'Arial Unicode MS, Heiti SC, Noto Sans CJK SC, sans-serif'
+  return 'Arial Unicode MS, Heiti SC, Noto Sans CJK SC, sans-serif' // 1 = Virgil
 }
 
 function renderText(el: Record<string, unknown>): string {
@@ -420,7 +423,7 @@ function renderFrame(el: Record<string, unknown>): string {
   const h = numOf(el.height)
   const name = strOf(el.name)
   const label = name
-    ? `<text x="${r2(x)}" y="${r2(y - 6)}" font-family="sans-serif" font-size="14" fill="#868e96">${esc(name)}</text>`
+    ? `<text x="${r2(x)}" y="${r2(y - 6)}" font-family="${fontFamily(2)}" font-size="14" fill="#868e96">${esc(name)}</text>`
     : ''
   return `${label}<rect x="${r2(x)}" y="${r2(y)}" width="${r2(w)}" height="${r2(h)}" fill="none" stroke="#adb5bd" stroke-width="1.5" rx="6" ry="6" />`
 }
@@ -535,7 +538,10 @@ let systemFontsRegistered = false
 function registerSystemFonts(globalFonts: { loadFontsFromDir(dir: string): number }): void {
   if (systemFontsRegistered) return
   systemFontsRegistered = true
-  for (const dir of ['/usr/share/fonts']) {
+  // Load common Linux and macOS system font roots. The local acceptance server
+  // runs on macOS; without these directories Skia falls back to a sparse Latin
+  // font and renders valid CJK glyphs as tofu boxes in Board PNG exports.
+  for (const dir of ['/usr/share/fonts', '/System/Library/Fonts', '/System/Library/Fonts/Supplemental', '/Library/Fonts']) {
     try {
       globalFonts.loadFontsFromDir(dir)
     } catch {

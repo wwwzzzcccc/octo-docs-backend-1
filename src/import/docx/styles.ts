@@ -22,6 +22,8 @@
 import { parseXmlOrdered, orderedTag, orderedAttr, type OrderedNode } from './xml.js'
 
 export interface StyleMap {
+  /** Document-wide run defaults from w:docDefaults/w:rPrDefault. */
+  defaultRunStyle: { fontFamily?: string; fontSize?: string }
   /**
    * Resolve a pStyle `w:val` (styleId) to its normalised style key: the
    * `<w:name w:val>` lower-cased with whitespace removed. Falls back to the
@@ -64,11 +66,35 @@ function orderedKids(node: OrderedNode, tag: string): OrderedNode[] {
  */
 export function parseStyles(buf?: Buffer): StyleMap {
   const idToName = new Map<string, string>()
+  const defaultRunStyle: { fontFamily?: string; fontSize?: string } = {}
   if (buf && buf.length > 0) {
     try {
       const top = parseXmlOrdered(buf)
       const stylesNode = top.find((n) => orderedTag(n) === 'w:styles')
       const children = stylesNode ? orderedKids(stylesNode, 'w:styles') : []
+      const docDefaults = children.find((n) => orderedTag(n) === 'w:docDefaults')
+      const defaultChildren = docDefaults ? orderedKids(docDefaults, 'w:docDefaults') : []
+      const rPrDefault = defaultChildren.find((n) => orderedTag(n) === 'w:rPrDefault')
+      const rPrDefaultChildren = rPrDefault ? orderedKids(rPrDefault, 'w:rPrDefault') : []
+      const rPr = rPrDefaultChildren.find((n) => orderedTag(n) === 'w:rPr')
+      const runProps = rPr ? orderedKids(rPr, 'w:rPr') : []
+      const rFonts = runProps.find((n) => orderedTag(n) === 'w:rFonts')
+      const defaultFont = rFonts
+        ? orderedAttr(rFonts, 'w:ascii') ?? orderedAttr(rFonts, 'w:hAnsi') ?? orderedAttr(rFonts, 'w:eastAsia')
+        : null
+      if (defaultFont) defaultRunStyle.fontFamily = defaultFont
+      const sz = runProps.find((n) => orderedTag(n) === 'w:sz')
+      const halfPoints = Number(sz ? orderedAttr(sz, 'w:val') : null)
+      if (Number.isFinite(halfPoints) && halfPoints > 0) {
+        // CSS px are 3/4 pt: OOXML half-points -> CSS px.
+        defaultRunStyle.fontSize = `${halfPoints * 2 / 3}px`
+      }
+      // Our DOCX serializer's baseline defaults are presentation defaults, not
+      // explicit source formatting. Do not turn them into marks on reimport.
+      if (defaultRunStyle.fontFamily === 'Times New Roman' && defaultRunStyle.fontSize === '16px') {
+        delete defaultRunStyle.fontFamily
+        delete defaultRunStyle.fontSize
+      }
       for (const st of children) {
         if (orderedTag(st) !== 'w:style') continue
         const styleId = orderedAttr(st, 'w:styleId')
@@ -82,6 +108,7 @@ export function parseStyles(buf?: Buffer): StyleMap {
     }
   }
   return {
+    defaultRunStyle,
     keyOf(styleId: string): string {
       return idToName.get(styleId) ?? normaliseStyleKey(styleId)
     },

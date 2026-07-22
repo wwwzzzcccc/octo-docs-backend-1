@@ -124,7 +124,14 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
     cardActionDecideHandler,
   )
 
-  app.use(express.json({ limit: '1mb' }))
+  const jsonBodyParser = express.json({ limit: '1mb' })
+  app.use((req, res, next) => {
+    // The Excalidraw importer needs the exact application/json bytes so it can
+    // reject malformed UTF-8/JSON and enforce its own byte boundary before
+    // walking the untrusted scene. Leave only that route for express.raw.
+    if (req.path.endsWith('/import/excalidraw')) return next()
+    return jsonBodyParser(req, res, next)
+  })
 
   // health check (no auth, and deliberately mounted BEFORE any rate limiter so
   // liveness/readiness probes are never throttled)
@@ -197,7 +204,9 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   botApi.use(docContentRouter)
   botApi.use(docSheetRouter)
   botApi.use(docSceneRouter)
+  botApi.use(exportRouter) // /v1/bot/docs/:docId/export/file?format=... and legacy PDF
   botApi.use(boardExportRouter) // /v1/bot/docs/:docId/export (whiteboard PNG/SVG, W3)
+  botApi.use(importRouter) // /v1/bot/docs/:docId/import/{docx|markdown|xlsx}
   app.use('/v1/bot/docs', botApi)
 
   // central error handler — unexpected errors => 500 (§8.4 error table).

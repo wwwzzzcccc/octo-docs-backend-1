@@ -89,4 +89,8 @@ export const docAttachmentRepo = {
     )
     return rows.map(mapRow)
   },
+
+  async deleteById(attachId: string): Promise<void> {
+    await query('DELETE FROM doc_attachment WHERE attach_id = ?', [attachId])
+  },
 }

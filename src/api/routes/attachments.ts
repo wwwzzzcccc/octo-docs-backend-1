@@ -591,7 +591,7 @@ async function readCapped(resp: Awaited<ReturnType<typeof fetch>>, cap: number):
  * Never touches a client-supplied URL — only object keys the DB already vouches for. Returns the
  * new attachId.
  */
-async function copyStoredObject(
+export async function copyStoredObject(
   src: DocAttachment,
   targetDocId: string,
   uid: string,
@@ -622,23 +622,41 @@ async function copyStoredObject(
   const attachId = newAttachId()
   // src.fileName was sanitized at its own register time; keep it (it is already a safe segment).
   const objectKey = `${targetDocId}/${attachId}/${src.fileName}`
-  await docAttachmentRepo.register({
-    attachId,
-    docId: targetDocId,
-    objectKey,
-    mime: src.mime,
-    sizeBytes: bytes.length,
-    fileName: src.fileName,
-    createdBy: uid,
-  })
-  const put = store.presignPut(objectKey, src.mime, config.attachments.uploadUrlTtlSeconds)
-  const putResp = await fetch(put.uploadUrl, {
-    method: 'PUT',
-    body: new Uint8Array(bytes),
-    headers: { 'Content-Type': src.mime, ...(put.headers ?? {}) },
-  })
-  if (!putResp.ok) throw new Error(`target write failed: ${putResp.status}`)
-  return attachId
+  try {
+    const put = store.presignPut(objectKey, src.mime, config.attachments.uploadUrlTtlSeconds)
+    const putResp = await fetch(put.uploadUrl, {
+      method: 'PUT',
+      body: new Uint8Array(bytes),
+      headers: { 'Content-Type': src.mime, ...(put.headers ?? {}) },
+    })
+    if (!putResp.ok) throw new Error(`target write failed: ${putResp.status}`)
+    await docAttachmentRepo.register({
+      attachId,
+      docId: targetDocId,
+      objectKey,
+      mime: src.mime,
+      sizeBytes: bytes.length,
+      fileName: src.fileName,
+      createdBy: uid,
+    })
+    return attachId
+  } catch (err) {
+    await Promise.allSettled([
+      docAttachmentRepo.deleteById(attachId),
+      store.delete(objectKey),
+    ])
+    throw err
+  }
+}
+
+/** Compensate a successful copy when the enclosing document edit does not commit. */
+export async function cleanupCopiedAttachment(attachId: string): Promise<void> {
+  const attachment = await docAttachmentRepo.getById(attachId)
+  if (!attachment) return
+  await Promise.allSettled([
+    docAttachmentRepo.deleteById(attachId),
+    getObjectStore().delete(attachment.objectKey),
+  ])
 }
 
 /**
@@ -698,7 +716,10 @@ export async function ingestHandler(req: Request, res: Response): Promise<void> 
       // Raster formats use their binary magic. A real SVG root is parsed and sanitized before it
       // can reach storage; active/malformed XML fails closed as not_an_image.
       let mime = sniffImageMime(bytes)
-      if (!mime) {
+      // sniffImageMime deliberately recognizes an SVG *candidate* because SVG
+      // has no binary magic. Candidate recognition is never a sanitation
+      // boundary: every SVG must still pass the active-XML sanitizer here.
+      if (!mime || mime === 'image/svg+xml') {
         try {
           bytes = sanitizeSvg(bytes)
           mime = 'image/svg+xml'

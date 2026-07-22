@@ -38,6 +38,7 @@ export interface ObjectStore {
    * than the raw Content-Type the client sent on the PUT (stored XSS — XIN-726).
    */
   presignGet(objectKey: string, expiresSec: number, opts?: PresignGetOptions): string
+  delete(objectKey: string): Promise<void>
 }
 
 export interface PresignGetOptions {
@@ -234,6 +235,11 @@ export class LocalHmacObjectStore implements ObjectStore {
     )
   }
 
+  async delete(objectKey: string): Promise<void> {
+    const { getLocalBlobStore } = await import('./localBlobStore.js')
+    await getLocalBlobStore().delete(applyKeyPrefix(this.keyPrefix, objectKey))
+  }
+
   /**
    * Verify a previously minted URL: checks the signature matches and the expiry
    * has not passed. Bound to this driver's secret. Exposed for tests and for a
@@ -427,7 +433,7 @@ export class S3ObjectStore implements ObjectStore {
   }
 
   private presign(
-    method: 'PUT' | 'GET',
+    method: 'PUT' | 'GET' | 'DELETE',
     objectKey: string,
     expiresSec: number,
     contentDisposition?: string,
@@ -522,6 +528,11 @@ export class S3ObjectStore implements ObjectStore {
       opts?.contentDisposition,
       opts?.responseContentType,
     )
+  }
+
+  async delete(objectKey: string): Promise<void> {
+    const response = await fetch(this.presign('DELETE', objectKey, 60), { method: 'DELETE' })
+    if (!response.ok && response.status !== 404) throw new Error(`object delete failed: ${response.status}`)
   }
 }
 

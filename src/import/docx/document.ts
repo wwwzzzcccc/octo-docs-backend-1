@@ -672,7 +672,12 @@ function listLineOf(
   if (checkbox) {
     const { inline, blocks } = collectInline(pChildren, rels, warnings, deadline)
     if (blocks.length) warnings.push('an image inside a task item was dropped')
-    return { ilvl: indentLevel(pPrChildren), kind: 'task', checked: checkbox.checked, inline }
+    // Our exporter writes one layout spacer immediately after the checkbox.
+    // It is not document content, so remove exactly one leading whitespace
+    // character. Do not trim all whitespace: a user-authored leading space in
+    // the task text is meaningful and must remain.
+    const taskInline = stripTaskCheckboxSpacer(inline)
+    return { ilvl: indentLevel(pPrChildren), kind: 'task', checked: checkbox.checked, inline: taskInline }
   }
 
   // Numbered/bulleted item: w:pPr/w:numPr with a numId.
@@ -710,6 +715,13 @@ function listLineOf(
   }
 
   return null
+}
+
+function stripTaskCheckboxSpacer(inline: PmNode[]): PmNode[] {
+  const first = inline[0]
+  if (first?.type !== 'text' || typeof first.text !== 'string' || !/^\s/.test(first.text)) return inline
+  const text = first.text.slice(1)
+  return text ? [{ ...first, text }, ...inline.slice(1)] : inline.slice(1)
 }
 
 /**
@@ -775,7 +787,13 @@ function mapParagraph(
   // paragraph's inline content. collectInline separates them out; we emit them
   // as sibling blocks AFTER the paragraph (their document position within the
   // paragraph flow is not representable, so trailing-sibling is the closest).
-  const { inline, blocks } = collectInline(pChildren, rels, warnings, deadline)
+  const { inline, blocks } = collectInline(
+    pChildren,
+    rels,
+    warnings,
+    deadline,
+    styles?.defaultRunStyle,
+  )
 
   const headingLevel = headingLevelFromStyle(styleId, styles)
   const attrs: Record<string, unknown> = {}
@@ -873,6 +891,7 @@ function collectInline(
   rels: RelMap,
   warnings: string[],
   deadline?: Deadline,
+  defaultRunStyle?: { fontFamily?: string; fontSize?: string },
 ): { inline: PmNode[]; blocks: PmNode[] } {
   const inline: PmNode[] = []
   const blocks: PmNode[] = []
@@ -894,7 +913,7 @@ function collectInline(
     tick()
     const tag = orderedTag(child)
     if (tag === 'w:r') {
-      mapRun(child, [], inline, blocks)
+      mapRun(child, [], inline, blocks, defaultRunStyle)
     } else if (tag === 'm:oMath') {
       // Inline math embedded directly in the paragraph flow.
       const latex = ommlToLatex(orderedToXml(child))
@@ -918,7 +937,7 @@ function collectInline(
       const linkMark: PmMark[] = href ? [{ type: 'link', attrs: { href } }] : []
       for (const run of kids(child, 'w:hyperlink')) {
         tick()
-        if (orderedTag(run) === 'w:r') mapRun(run, linkMark, inline, blocks)
+        if (orderedTag(run) === 'w:r') mapRun(run, linkMark, inline, blocks, defaultRunStyle)
       }
     }
   }
@@ -931,10 +950,16 @@ function collectInline(
  * (+ inherited). Embedded images (w:drawing) are block atoms and go into
  * `blocks`, not the inline flow. Children are processed in document order.
  */
-function mapRun(run: OrderedNode, inherited: PmMark[], inline: PmNode[], blocks: PmNode[]): void {
+function mapRun(
+  run: OrderedNode,
+  inherited: PmMark[],
+  inline: PmNode[],
+  blocks: PmNode[],
+  defaultRunStyle?: { fontFamily?: string; fontSize?: string },
+): void {
   const runChildren = kids(run, 'w:r')
   const rPr = firstChild(runChildren, 'w:rPr')
-  const marks = [...inherited, ...marksFromRunProps(rPr)]
+  const marks = [...inherited, ...marksFromRunProps(rPr, defaultRunStyle)]
 
   for (const child of runChildren) {
     const tag = orderedTag(child)
@@ -959,10 +984,30 @@ function mapRun(run: OrderedNode, inherited: PmMark[], inline: PmNode[], blocks:
  * later by the async media step (⑥); here we only emit the placeholder.
  */
 function drawingToImage(drawing: OrderedNode): PmNode | null {
-  const embedRel = findEmbedRel(drawing)
+  // Office stores a PNG fallback on a:blip and the original vector relation on
+  // asvg:svgBlip. Prefer the native SVG relation. We still emit exactly one
+  // placeholder, and older documents without svgBlip retain raster fallback.
+  const svgRel = findSvgEmbedRel(drawing)
+  const rasterRel = findEmbedRel(drawing)
+  const embedRel = svgRel ?? rasterRel
   if (!embedRel) return null
   const alt = findDocPrDescr(drawing)
-  return imagePlaceholder(embedRel, alt)
+  return imagePlaceholder(embedRel, alt, svgRel ? rasterRel : null)
+}
+
+function findSvgEmbedRel(node: OrderedNode, depth = 0): string | null {
+  if (depth > MAX_DRAWING_DEPTH) return null
+  const tag = orderedTag(node)
+  if (tag === 'asvg:svgBlip' || tag?.endsWith(':svgBlip')) {
+    return orderedAttr(node, 'r:embed') ?? null
+  }
+  if (tag) {
+    for (const child of kids(node, tag)) {
+      const found = findSvgEmbedRel(child, depth + 1)
+      if (found) return found
+    }
+  }
+  return null
 }
 
 /** Max recursion depth for the in-memory drawing DFS. The extract-layer CPU
@@ -1005,9 +1050,11 @@ function findDocPrDescr(node: OrderedNode, depth = 0): string | null {
 }
 
 /** w:rPr → the PM marks it implies. */
-function marksFromRunProps(rPr: OrderedNode | undefined): PmMark[] {
-  if (!rPr) return []
-  const c = kids(rPr, 'w:rPr')
+function marksFromRunProps(
+  rPr: OrderedNode | undefined,
+  defaults?: { fontFamily?: string; fontSize?: string },
+): PmMark[] {
+  const c = rPr ? kids(rPr, 'w:rPr') : []
   const marks: PmMark[] = []
 
   const b = firstChild(c, 'w:b')
@@ -1045,20 +1092,21 @@ function marksFromRunProps(rPr: OrderedNode | undefined): PmMark[] {
   }
 
   const color = ooxmlHexColor(orderedAttr(firstChild(c, 'w:color') ?? {}, 'w:val'))
-  // v7 textStyle carries BOTH color and fontSize; w:sz is in half-points, and
-  // the editor stores fontSize as a CSS px string. w:rFonts/@w:ascii gives the
-  // font family. All ride on ONE textStyle mark (schema attrs: color/fontSize).
+  // w:sz is in half-points; convert to CSS px (1pt = 4/3px), which makes both
+  // PDF (px -> pt) and DOCX (px -> half-points) preserve the source size.
   const szHalfPts = Number(orderedAttr(firstChild(c, 'w:sz') ?? {}, 'w:val'))
-  // Exporter maps the editor's px number directly to half-points via
-  // `parseFloat("16px") * 2` (a deliberate px≈pt shortcut, marks.ts). Reverse it
-  // symmetrically: half-points / 2 → the same px number, so a round-trip is
-  // lossless for self-exported docs.
   const fontSize =
-    Number.isFinite(szHalfPts) && szHalfPts > 0 ? `${szHalfPts / 2}px` : null
-  if (color || fontSize) {
+    Number.isFinite(szHalfPts) && szHalfPts > 0 ? `${szHalfPts * 2 / 3}px` : defaults?.fontSize
+  const rFonts = firstChild(c, 'w:rFonts') ?? {}
+  const fontFamily = orderedAttr(rFonts, 'w:ascii')
+    ?? orderedAttr(rFonts, 'w:hAnsi')
+    ?? orderedAttr(rFonts, 'w:eastAsia')
+    ?? defaults?.fontFamily
+  if (color || fontSize || fontFamily) {
     const attrs: Record<string, unknown> = {}
     if (color) attrs.color = color
     if (fontSize) attrs.fontSize = fontSize
+    if (fontFamily) attrs.fontFamily = fontFamily
     marks.push({ type: 'textStyle', attrs })
   }
 

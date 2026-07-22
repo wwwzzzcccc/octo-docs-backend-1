@@ -154,18 +154,15 @@ describe('collectFormulaLatex', () => {
   })
 })
 
-// The probe compiles each formula in isolation and MUST stay bounded: it holds
-// a scarce compile slot, so an unbounded probe over thousands of formulas is a
-// DoS. These tests assert the count/budget guards short-circuit before spawning
-// any compile, which is the security-relevant invariant (they do not depend on
-// a real `typst` binary being present).
+// Attribution is batched and MUST stay bounded: it holds a scarce compile slot,
+// so an unbounded search is a DoS. On exhaustion unresolved formulas are marked
+// verbatim; already-proven formulas can remain math in the partial retry.
 describe('probeFailingFormulas — bounding', () => {
-  it('abandons probing (exhausted) without compiling when the formula count exceeds the cap', async () => {
+  it('conservatively returns all formulas when no probe compile is allowed', async () => {
     const many = Array.from({ length: 100 }, (_, i) => `x_${i}`)
-    const { failing, exhausted } = await probeFailingFormulas(many, 't', { maxProbes: 40, budgetMs: 15_000 })
-    // Over the cap -> bail out immediately, no formula marked, defer to whole-doc verbatim.
+    const { failing, exhausted } = await probeFailingFormulas(many, 't', { maxProbes: 0, budgetMs: 15_000 })
     expect(exhausted).toBe(true)
-    expect(failing.size).toBe(0)
+    expect(failing).toEqual(new Set(many))
   })
 
   it('does not exhaust for an empty formula set', async () => {
@@ -175,7 +172,8 @@ describe('probeFailingFormulas — bounding', () => {
   })
 
   it('treats a zero probe budget as immediately exhausted', async () => {
-    const { exhausted } = await probeFailingFormulas(['a', 'b'], 't', { maxProbes: 0, budgetMs: 15_000 })
+    const { failing, exhausted } = await probeFailingFormulas(['a', 'b'], 't', { maxProbes: 40, budgetMs: 0 })
     expect(exhausted).toBe(true)
+    expect(failing).toEqual(new Set(['a', 'b']))
   })
 })

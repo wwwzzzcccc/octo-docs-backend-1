@@ -76,6 +76,7 @@ export interface BlobStore {
     limit: number,
   ): Promise<{ bytes: number }>
   get(objectKey: string): Promise<StoredObject | null>
+  delete(objectKey: string): Promise<void>
 }
 
 class LocalFsBlobStore implements BlobStore {
@@ -136,6 +137,11 @@ class LocalFsBlobStore implements BlobStore {
     } catch {
       return null
     }
+  }
+
+  async delete(objectKey: string): Promise<void> {
+    const { blobPath, typePath } = pathsFor(objectKey)
+    await Promise.all([fs.rm(blobPath, { force: true }), fs.rm(typePath, { force: true })])
   }
 }
 

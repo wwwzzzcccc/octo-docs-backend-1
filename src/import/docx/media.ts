@@ -20,6 +20,7 @@
  */
 import type { PmNode } from './types.js'
 import type { ExtractedEntry } from './extract.js'
+import { sanitizeSvg } from '../../util/sanitizeSvg.js'
 
 /** image magic numbers → mime. Extension is never trusted. */
 const IMAGE_MAGIC: Array<{ mime: string; test: (b: Buffer) => boolean }> = [
@@ -42,15 +43,21 @@ const IMAGE_MAGIC: Array<{ mime: string; test: (b: Buffer) => boolean }> = [
 /** Sniff an image mime by magic number, or null if it isn't a known image. */
 export function sniffImageMime(bytes: Buffer): string | null {
   for (const { mime, test } of IMAGE_MAGIC) if (test(bytes)) return mime
+  // This is only a candidate check. SVG has no magic number, so the import
+  // path MUST pass candidates through sanitizeSvg before storage.
+  const prefix = bytes.subarray(0, Math.min(bytes.length, 4096)).toString('utf8').replace(/^\uFEFF/, '').trimStart()
+  if (/<svg(?:\s|>)/i.test(prefix) && !/<html(?:\s|>)/i.test(prefix)) return 'image/svg+xml'
   return null
 }
 
 /** The private attr the walker uses to reference a drawing's embed rId. */
 export const EMBED_REL_ATTR = '_embedRel'
+export const FALLBACK_EMBED_REL_ATTR = '_fallbackEmbedRel'
 
 /** Build the placeholder image node the walker emits (pre-upload). */
-export function imagePlaceholder(embedRelId: string, alt: string | null): PmNode {
+export function imagePlaceholder(embedRelId: string, alt: string | null, fallbackRelId?: string | null): PmNode {
   const attrs: Record<string, unknown> = { [EMBED_REL_ATTR]: embedRelId }
+  if (fallbackRelId && fallbackRelId !== embedRelId) attrs[FALLBACK_EMBED_REL_ATTR] = fallbackRelId
   if (alt) attrs.alt = alt
   return { type: 'image', attrs }
 }
@@ -113,6 +120,9 @@ async function resolveOne(
   warnings: string[],
 ): Promise<PmNode> {
   const relId = String(image.attrs![EMBED_REL_ATTR])
+  const fallbackRel = typeof image.attrs![FALLBACK_EMBED_REL_ATTR] === 'string'
+    ? String(image.attrs![FALLBACK_EMBED_REL_ATTR])
+    : null
   const alt = typeof image.attrs!.alt === 'string' ? (image.attrs!.alt as string) : null
   const media = resolveMedia(relId)
 
@@ -132,19 +142,35 @@ async function resolveOne(
     }
   }
 
-  if (!media) return degrade('source missing')
-  if (media.data.length > ctx.maxImageBytes) return degrade('too large')
+  const fallback = async (reason: string): Promise<PmNode> => {
+    if (!fallbackRel) return degrade(reason)
+    warnings.push(`a native SVG could not be imported (${reason}); its raster fallback was used`)
+    return resolveOne(imagePlaceholder(fallbackRel, alt), resolveMedia, ctx, warnings)
+  }
+
+  if (!media) return fallback('source missing')
+  if (media.data.length > ctx.maxImageBytes) return fallback('too large')
 
   const mime = sniffImageMime(media.data)
-  if (!mime) return degrade('unrecognised image format')
+  if (!mime) return fallback('unrecognised image format')
 
+  let bytes = media.data
+  if (mime === 'image/svg+xml') {
+    try {
+      // OOXML is untrusted input. Never persist original SVG bytes: active XML,
+      // external references and scripts must be removed by the shared sanitizer.
+      bytes = sanitizeSvg(media.data)
+    } catch {
+      return fallback('invalid or unsafe SVG')
+    }
+  }
   try {
     const fileName = media.name.split('/').pop() ?? 'image'
-    const attachId = await ctx.upload({ bytes: media.data, mime, fileName })
+    const attachId = await ctx.upload({ bytes, mime, fileName })
     const attrs: Record<string, unknown> = { attachId }
     if (alt) attrs.alt = alt
     return { type: 'image', attrs }
   } catch {
-    return degrade('upload failed')
+    return fallback('upload failed')
   }
 }

@@ -136,6 +136,16 @@ describe('serializeSceneToSvg', () => {
     expect(svg).not.toContain('<world>')
   })
 
+  it('uses the CJK-capable font stack for frame labels as well as text elements', () => {
+    const svg = serializeSceneToSvg({
+      elements: [el('f1', 'frame', { x: 40, y: 80, width: 300, height: 160, name: '流程分组' })],
+      files: {},
+    })
+    expect(svg).toContain('流程分组')
+    expect(svg).toContain('font-family="Arial Unicode MS, Heiti SC, Noto Sans CJK SC, sans-serif"')
+    expect(svg).not.toContain('font-family="sans-serif" font-size="14"')
+  })
+
   it('renders an empty scene as a small blank white canvas (valid, openable)', () => {
     const svg = serializeSceneToSvg({ elements: [], files: {} })
     expect(svg.startsWith('<svg')).toBe(true)

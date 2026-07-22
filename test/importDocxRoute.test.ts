@@ -11,16 +11,31 @@ vi.mock('../src/api/guard.js', () => ({
 vi.mock('../src/import/docx/index.js', () => ({
   importDocxWithMedia: vi.fn(),
 }))
+vi.mock('../src/util/ids.js', () => ({ newAttachId: vi.fn(() => 'att_test') }))
 vi.mock('../src/db/repos/docAttachmentRepo.js', () => ({
-  docAttachmentRepo: { register: vi.fn(async () => undefined) },
+  docAttachmentRepo: {
+    register: vi.fn(async () => undefined),
+    getById: vi.fn(async (attachId: string) => attachId === 'att_test' ? { attachId, objectKey: 'd1/att_test/image.png', docId: 'd1' } : null),
+    deleteById: vi.fn(async () => undefined),
+  },
 }))
+const objectDelete = vi.fn(async () => undefined)
 vi.mock('../src/storage/objectStore.js', () => ({
-  getObjectStore: vi.fn(() => ({ presignPut: () => ({ uploadUrl: 'http://x', headers: {} }) })),
+  getObjectStore: vi.fn(() => ({
+    presignPut: () => ({ uploadUrl: 'http://x', headers: {} }),
+    delete: objectDelete,
+  })),
 }))
 vi.mock('../src/import/docx/importQueue.js', () => ({
   acquireDocxImportSlot: vi.fn(async () => undefined),
   releaseDocxImportSlot: vi.fn(),
   DocxImportBusyError: class DocxImportBusyError extends Error {},
+}))
+vi.mock('../src/collab/liveDocWrite.js', () => ({
+  readLiveForEdit: vi.fn(),
+}))
+vi.mock('../src/api/services/editDocBody.js', () => ({
+  editDocBody: vi.fn(),
 }))
 
 import { importDocxHandler } from '../src/api/routes/import.js'
@@ -32,6 +47,9 @@ import {
   releaseDocxImportSlot,
   DocxImportBusyError,
 } from '../src/import/docx/importQueue.js'
+import { readLiveForEdit } from '../src/collab/liveDocWrite.js'
+import { editDocBody } from '../src/api/services/editDocBody.js'
+import { docAttachmentRepo } from '../src/db/repos/docAttachmentRepo.js'
 
 const guard = vi.mocked(requireDocRole)
 const parse = vi.mocked(importDocxWithMedia)
@@ -59,8 +77,14 @@ function mockRes(): MockRes {
   }
 }
 /** Build a minimal Request; only the fields importDocxHandler reads are set. */
-function req(body: unknown): Request {
-  return { uid: 'u1', spaceId: 's1', params: { docId: 'd1' }, body } as unknown as Request
+function req(body: unknown, headers: Record<string, string> = {}): Request {
+  return {
+    uid: 'u1',
+    spaceId: 's1',
+    params: { docId: 'd1' },
+    body,
+    header: (name: string) => headers[name.toLowerCase()],
+  } as unknown as Request
 }
 /** Read a JSON body field without an `any` cast. */
 function field(res: MockRes, key: string): unknown {
@@ -71,7 +95,9 @@ async function run(res: MockRes, body: unknown): Promise<void> {
 }
 
 // requireDocRole resolves to a guard object (writer allowed) or undefined.
-const guardOk = { meta: { doc_id: 'd1' } } as unknown as Awaited<ReturnType<typeof requireDocRole>>
+const guardOk = {
+  meta: { doc_id: 'd1', document_name: 'octo:s:f:d1', doc_type: 'doc', permission_epoch: 0 },
+} as unknown as Awaited<ReturnType<typeof requireDocRole>>
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -182,5 +208,110 @@ describe('importDocxHandler — status mapping', () => {
     expect(res.statusCode).toBe(200)
     expect((field(res, 'doc') as { type: string }).type).toBe('doc')
     expect(field(res, 'warnings')).toEqual(['w1'])
+  })
+
+  it('cleans DOCX-created attachments when atomic apply is rejected', async () => {
+    guard.mockResolvedValue(guardOk)
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200 })))
+    parse.mockImplementation(async (_buffer, uploadCtx) => {
+      const attachId = await uploadCtx!.upload({
+        bytes: Buffer.from('png'), mime: 'image/png', fileName: 'image.png',
+      })
+      expect(attachId).toBe('att_test')
+      return { doc: { type: 'doc', content: [{ type: 'image', attrs: { attachId } }] }, warnings: [] }
+    })
+    vi.mocked(readLiveForEdit).mockResolvedValue({ pmDoc: { childCount: 0 }, baseSV: new Uint8Array([1]) } as never)
+    vi.mocked(editDocBody).mockResolvedValue({ ok: false, status: 412, error: 'base_version_stale' })
+    const res = mockRes()
+    await importDocxHandler(req(Buffer.from('PKzip'), { 'x-octo-import-apply': 'true' }), res as unknown as Response)
+    expect(res.statusCode).toBe(412)
+    expect(docAttachmentRepo.deleteById).toHaveBeenCalledWith('att_test')
+    expect(objectDelete).toHaveBeenCalledWith('d1/att_test/image.png')
+    vi.unstubAllGlobals()
+  })
+
+  it('atomically applies the parsed doc when the CLI apply header is present', async () => {
+    guard.mockResolvedValue(guardOk)
+    parse.mockResolvedValue({
+      doc: { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'large import' }] }] },
+      warnings: ['w1'],
+    })
+    vi.mocked(readLiveForEdit).mockResolvedValue({
+      pmDoc: { childCount: 0 },
+      baseSV: new Uint8Array([1]),
+    } as unknown as Awaited<ReturnType<typeof readLiveForEdit>>)
+    vi.mocked(editDocBody).mockResolvedValue({
+      ok: true,
+      bytes: 42,
+      baseVersion: 'BV_NEW==',
+      newDocVersionSeq: 2,
+    })
+    const res = mockRes()
+    await importDocxHandler(
+      req(Buffer.from('PKzip'), { 'x-octo-import-apply': 'true' }),
+      res as unknown as Response,
+    )
+    expect(res.statusCode).toBe(200)
+    expect(field(res, 'doc')).toBeUndefined()
+    expect(field(res, 'baseVersion')).toBe('BV_NEW==')
+    expect(field(res, 'warnings')).toEqual(['w1'])
+    expect(editDocBody).toHaveBeenCalledWith(
+      expect.objectContaining({
+        docId: 'd1',
+        documentName: 'octo:s:f:d1',
+        ops: [
+          expect.objectContaining({
+            type: 'insert',
+            content: [{ type: 'paragraph', content: [{ type: 'text', text: 'large import' }] }],
+          }),
+        ],
+      }),
+    )
+  })
+})
+
+describe('importDocxHandler — imported image attachment ownership', () => {
+  it('strips a foreign image attachId before atomic apply and keeps its src', async () => {
+    guard.mockResolvedValue(guardOk)
+    parse.mockResolvedValue({
+      doc: {
+        type: 'doc',
+        content: [
+          {
+            type: 'image',
+            attrs: { attachId: 'att_from_another_doc', src: 'https://cdn.example.com/image.png' },
+          },
+        ],
+      },
+      warnings: [],
+    })
+    vi.mocked(readLiveForEdit).mockResolvedValue({
+      pmDoc: { childCount: 0 },
+      baseSV: new Uint8Array([1]),
+    } as unknown as Awaited<ReturnType<typeof readLiveForEdit>>)
+    vi.mocked(editDocBody).mockResolvedValue({
+      ok: true,
+      bytes: 42,
+      baseVersion: 'BV_NEW==',
+      newDocVersionSeq: 2,
+    })
+
+    const res = mockRes()
+    await importDocxHandler(
+      req(Buffer.from('PKzip'), { 'x-octo-import-apply': 'true' }),
+      res as unknown as Response,
+    )
+
+    expect(res.statusCode).toBe(200)
+    expect(field(res, 'warnings')).toEqual(['docs.import.foreignImageAttachmentsSkipped:1'])
+    expect(editDocBody).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ops: [
+          expect.objectContaining({
+            content: [{ type: 'image', attrs: { src: 'https://cdn.example.com/image.png' } }],
+          }),
+        ],
+      }),
+    )
   })
 })
