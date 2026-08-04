@@ -38,6 +38,31 @@ import { advanceEditVersion } from './liveDocWrite.js'
 import { COLLAB_FIELD } from '../schema/index.js'
 import type { Node as PMNode } from 'prosemirror-model'
 
+/** Top-level marker written atomically with an authoritative board restore. */
+export const BOARD_RESTORE_META_FIELD = 'boardRestoreMeta'
+export const BOARD_RESTORE_EPOCH_KEY = 'epoch'
+
+/**
+ * Apply one authoritative board restore to the live Y.Doc. The monotonic marker
+ * and scene replacement share a transaction, so clients can choose replace
+ * semantics instead of ordinary version reconciliation. Exported for tests.
+ */
+export function reconcileBoardRestoreOntoDoc(doc: Y.Doc, targetState: Uint8Array): number {
+  const meta = doc.getMap<unknown>(BOARD_RESTORE_META_FIELD)
+  const current = meta.get(BOARD_RESTORE_EPOCH_KEY)
+  const previous = typeof current === 'number' && Number.isSafeInteger(current) && current >= 0
+    ? current
+    : 0
+  // Yjs transactions are not rollback transactions when their callback throws. Validate the
+  // marker before touching the scene so exhaustion cannot leave a replaced scene without its
+  // corresponding authoritative epoch.
+  if (previous >= Number.MAX_SAFE_INTEGER) throw new Error('board_restore_epoch_exhausted')
+  const epoch = previous + 1
+  reconcileBoardMaps(doc, targetState)
+  meta.set(BOARD_RESTORE_EPOCH_KEY, epoch)
+  return epoch
+}
+
 /**
  * Reconcile a restore's content onto a live doc, in place. MUST run inside the
  * doc's transaction so the deletions land as causal tombstones on the live struct
@@ -131,7 +156,7 @@ export async function applyBoardRestoreToLiveDoc(
   const connection = await server.hocuspocus.openDirectConnection(documentName, { user: { id: uid } })
   try {
     await connection.transact((doc: Document) => {
-      reconcileBoardMaps(doc, targetState)
+      reconcileBoardRestoreOntoDoc(doc, targetState)
     })
   } finally {
     await connection.disconnect()
